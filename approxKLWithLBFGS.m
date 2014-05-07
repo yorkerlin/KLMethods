@@ -1,4 +1,4 @@
-function [alpha, sW, L, nlZ, dnlZ] = approxKL(hyper, covfunc, lik, x, y)
+function [alpha, sW, L, nlZ, dnlZ] = approxKLWithLBFGS(hyper, covfunc, lik, x, y)
 
 % Approximation to the posterior Gaussian Process by minimization of the 
 % KL-divergence. The function takes a specified covariance function (see 
@@ -14,20 +14,18 @@ K = feval(covfunc{:}, hyper, x);                % evaluate the covariance matrix
 alla_init{1} = zeros(2*n,1);                       % stack alpha/lambda together
 
 % b) initial values based on random values heuristic
-alla_init{2} = [y.*rand(n,1); -abs(randn(n,1))]/5000;     
+%alla_init{2} = [y.*rand(n,1); -abs(randn(n,1))]/5000;     
 
 % c) start from Laplace approximation
-[alpha,sW] = approxLA(hyper, covfunc, lik, x, y);
-alla_init{3} = [alpha; -sW.^2/2];
+%[alpha,sW] = approxLA(hyper, covfunc, lik, x, y);
+%alla_init{3} = [alpha; -sW.^2/2];
 
 % d) use order of magnitude from Laplace starting point
-alla_init{4} = [y*min(abs(alpha)); ones(n,1)*(-mean(abs(sW))^2/2)];
+%alla_init{4} = [y*min(abs(alpha)); ones(n,1)*(-mean(abs(sW))^2/2)];
 
 % use only some inits
-alla_init=alla_init([1,3]);
-
-max_it=30;                                 % maximum number of Newton iterations 
-tol = 1e-6;                   % tolerance for when to stop the Newton iterations
+%alla_init=alla_init([1,3]);
+alla_init=alla_init([1]);
 
 for alla_id = 1:length(alla_init)              % iterate over initial conditions
 
@@ -36,49 +34,7 @@ for alla_id = 1:length(alla_init)              % iterate over initial conditions
     use_pinv=false; check_cond=true;
     nlZ_old = Inf; nlZ_new = 1e100; it=0;      % make sure the while loop starts
 
-    while nlZ_new < nlZ_old - tol && it < max_it     % begin Newton's iterations
-
-        % save old values
-        alla_old = alla;
-
-        % calculate gradient and Hessian
-        [nlZ_old,dnlZ,d2nlZ] = margLik(alla,K,y,lik);
-
-        if check_cond                                  % check for bad condition
-            if rcond(d2nlZ)<1e-12, use_pinv=true; end       % executed only once
-            check_cond = false;
-        end
-
-        % update parameters
-        if use_pinv
-            alla = alla - pinv(d2nlZ)*dnlZ;    % if Hessian is badly conditioned
-        else     
-            alla = alla - d2nlZ\dnlZ;
-        end
-
-        % make sure the la parameters stay negative
-        alla(end/2+1:end) = -abs(alla(end/2+1:end));
-
-        % new objective value
-        nlZ_new = margLik(alla,K,y,lik);
-
-        i = 0;
-        while i < 10 && nlZ_new > nlZ_old         % if objective didn't increase
-            alla = (alla_old+alla)/2;                 % reduce step size by half
-            nlZ_new = margLik(alla,K,y,lik);
-            i = i+1;
-        end
-        if i==10     % give up
-            alla = alla_old;
-            nlZ_new = nlZ_old;
-        end
-
-        it=it+1;
-    end
-
-    if it == max_it
-      disp('Warning: maximum number of iterations reached in function approxKL')
-    end
+	[alla nlZ_new] = lbfgs(alla, K, y, lik);  %using L-BFGS to find the opt alla
 
     % save results
     alla_result{alla_id} = alla;
@@ -88,8 +44,12 @@ end
 alla_id = find(nlZ_result==min(nlZ_result)); alla_id = alla_id(1);
 alla    = alla_result{alla_id};                            % extract best result
 
-alpha = alla(1:end/2,1);
-W  = -2*alla(end/2+1:end,1);
+%display the result
+nlZ_new = min(nlZ_result)
+alla
+
+alpha = alla(1:end/2,1)
+W  = -2*alla(end/2+1:end,1)
 
 % recalculate L
 sW = sqrt(W);                     
@@ -100,6 +60,7 @@ L  = chol(eye(n)+sW*sW'.*K);                             % L'*L=B=eye(n)+sW*K*sW
 % bound on neg log marginal likelihood
 nlZ = nlZ_result( alla_id);       
 
+%estimate the hpyer parameter
 % do we want derivatives?
 if nargout >=4                                     
     dnlZ = zeros(size(hyper));                  % allocate space for derivatives
@@ -109,9 +70,11 @@ if nargout >=4
     lambda = alla(end/2+1:end  ,1);
     
     A = inv(  eye(n)-2*K*diag(lambda)  );
-    [a,dm,dC] = a_related(K*alpha,abs(diag(A*K)),y,lik);
+	[a,dm,dC] = a_related(K*alpha,abs(diag(A*K)),y,lik);
+
     for j=1:length(hyper)
         dK = feval(covfunc{:},hyper,x,j);
+		%           from the paper 
         %           -alpha'*dK*dm +(alpha'*dK*alpha)/2 -diag(A*dK*A')'*dC 
         %           -trace(A'*diag(lambda)*dK) +trace(A*dK*diag(lambda)*A)
         AdK  = A*dK;
@@ -120,11 +83,9 @@ if nargout >=4
     end
 end
 
-
-
-%% evaluation of current log marginal likelihood depending on the
+%% evaluation of current negative log marginal likelihood depending on the
 %  parameters alpha (al) and lambda (la)
-function [nlZ,dnlZ,d2nlZ] = margLik(alla,K,y,lik)
+function [nlZ,dnlZ] = margLik(alla,K,y,lik)
     % extract single parameters
     alpha  = alla(1:end/2,1);
     lambda = alla(end/2+1:end,1);
@@ -140,15 +101,13 @@ function [nlZ,dnlZ,d2nlZ] = margLik(alla,K,y,lik)
     % calculate alpha related terms we need
     if nargout==1
        [a] = a_related(m,v,y,lik);
-    elseif nargout==2
-       [a,dm,dV] = a_related(m,v,y,lik);
     else
-       [a,dm,dV,d2m,d2V,dmdV] = a_related(m,v,y,lik);
+       [a,dm,dV] = a_related(m,v,y,lik);
     end
-    
-    % Likelihood
+
+    %negative Likelihood
     nlZ = -a -logdet(VinvK)/2 -n/2 +(alpha'*K*alpha)/2 +trace(VinvK)/2;
-    
+
     if nargout>1 % gradient of Likelihood
         dlZ_alpha  = K*(dm-alpha);
         dlZ_lambda = 2*(V.*V)*dV +v -sum(V.*VinvK,2);   % => fast diag(V*VinvK')
@@ -157,26 +116,19 @@ function [nlZ,dnlZ,d2nlZ] = margLik(alla,K,y,lik)
         dnlZ = -[dlZ_alpha; dlZ_lambda];
     end
 
-    if nargout>2 % Hessian of Likelihood
-        dal_dal = K*diag(d2m)*K-K;
-        dal_dla = 2*(V.*V)*diag(dmdV)*K;
 
-        % da/dV * d(V.*V)/dlam_i term from a
-        tmp=zeros(n);
-        for i=1:n
-            Vi=sqrt(8)*V(:,i);
-            tmp(:,i)=((Vi*Vi').*V)*dV;
-        end
-        
-        dla_dla = VinvK*V;
-        dla_dla = 2*V.*(V-dla_dla-dla_dla');                    % terms from b/c
-        dla_dla = 4*(V.*V)*diag(d2V)*(V.*V)+ tmp' +dla_dla;   % add terms from a
-
-        % stack things together 
-        d2nlZ = [dal_dal, dal_dla';
-                   dal_dla, dla_dla];
-        d2nlZ = -(d2nlZ+d2nlZ')/2;                    % numerical symmetrization
-    end
+function [alla nlZ] = lbfgs(alla, K, y, lik)
+	optMinFunc = struct('Display', 'FULL',...
+    'Method', 'lbfgs',...
+    'DerivativeCheck', 'off',...
+    'LS_type', 1,...
+    'MaxIter', 1000,...
+	'LS_interp', 1,...
+    'MaxFunEvals', 1000000,...
+    'Corr' , 100,...
+    'optTol', 1e-15,...
+    'progTol', 1e-15);
+	[alla, nlZ] = minFunc(@margLik, alla, optMinFunc, K, y, lik);
 
 
 %% log(det(A)) for det(A)>0
@@ -197,7 +149,6 @@ function y = logdet(A)
     %    y=sum(log(d)); y=real(y); 
     %   => slowest
 
-    
 %% compute all terms related to a
 % derivatives w.r.t diag(V) and m, 2nd derivatives w.r.t diag(V) and m
 function [a,dm,dV,d2m,d2V,dmdV]=a_related(m,v,y,lik)
